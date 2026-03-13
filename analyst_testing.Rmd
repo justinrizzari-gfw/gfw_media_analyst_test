@@ -1,0 +1,842 @@
+---
+title: "GFW Media Analysis Test"
+author: "Justin Rizzari"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    df_print: default
+    highlight: pygments
+    toc: yes
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 6
+editor_options:
+  chunk_output_type: inline
+---
+
+# Introduction
+
+This notebook will produce an analysis of fishing activity within the Mediterranean Sea in 2019 as part of the GFW Media Analyst role.
+
+# Setup
+
+Set default code chunk options
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Load packages
+
+```{r load packages}
+library(tidyverse)
+library(bigrquery)
+library(DBI)
+library(fishwatchr)
+library(glue)
+library(lubridate)
+library(here)
+library(sf)
+library(extrafont)
+library(patchwork)
+library(terra)
+library(kableExtra)
+library(gridExtra)
+library(dplyr)
+library(colorspace)
+library(grid)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library (gfwr)
+library(stringr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(countrycode)
+library(stringr)
+library(rlang)
+library(purrr)
+library(patchwork)
+library(cowplot)
+library(magick)
+library(officer)
+library(flextable)
+```
+
+Load the CSV data set
+```{r}
+# Load CSV
+fishing_data <- read_csv(here("analyst_fishing_data.csv"))
+```
+
+Set some commonly used parameters for mapping
+```{r defining map parameters}
+# define bounding box/area of interest
+bbox <- data.frame(x_min = -6,
+                   x_max = 37, 
+                   y_min = 30,
+                   y_max = 46)
+
+# what longitude do we want to center maps on
+best_center <- 15
+
+# what projection should be used for mapping
+# if you're having trouble with the dateline I recommend using this projection
+best_proj <- str_c("+proj=eqearth +lon_0=", best_center, " +wktext", sep = "")
+
+# resolution for fishing effort data
+# 10 for 10th of a degree (0.1)
+# 100 for 100th of a degree (0.01)
+res <- 10
+```
+
+Load the two shapefiles of GFCM area 1 and 4.
+```{r loading shapefile of HSPs}
+gfcm1_sf <- st_read(
+  here("VME-DB_VME_GFCM_1", "closuresPolygon.shp")
+) %>%
+  fishwatchr::recenter_sf(center = best_center, proj = best_proj)
+
+gfcm4_sf <- st_read(
+  here("VME-DB_VME_GFCM_4", "other_areas.shp")
+) %>%
+  fishwatchr::recenter_sf(center = best_center, proj = best_proj)
+```
+
+# Summary
+Calculate the total fishing hours, by gear type, inside both closure areas in 2019.
+I calculated the total fishing hours in 2019 inside the two GFCM closure areas by gear type. 
+Fishing effort records were spatially intersected with the closure polygons, and total fishing hours 
+were summed for each gear category within each closure and combined across both areas.
+```{r}
+# -----------------------------
+# All gear classes present in dataset
+# -----------------------------
+all_gears <- fishing_data %>%
+  filter(!is.na(fishing_class)) %>%
+  distinct(fishing_class)
+
+# -----------------------------
+# Prepare closure polygons
+# -----------------------------
+closures_tbl <- bind_rows(
+  gfcm1_sf %>% mutate(closure_area = "GFCM Closure Area 1"),
+  gfcm4_sf %>% mutate(closure_area = "GFCM Closure Area 4")
+) %>%
+  st_make_valid() %>%
+  st_transform(4326)
+
+# -----------------------------
+# Filter fishing data to 2019
+# -----------------------------
+fishing_2019 <- fishing_data %>%
+  filter(
+    year == 2019,
+    !is.na(lon_bin),
+    !is.na(lat_bin),
+    !is.na(fishing_hours),
+    !is.na(fishing_class)
+  )
+
+# -----------------------------
+# Convert to sf points
+# -----------------------------
+fishing_2019_sf <- fishing_2019 %>%
+  st_as_sf(coords = c("lon_bin", "lat_bin"), crs = 4326, remove = FALSE) %>%
+  st_transform(st_crs(closures_tbl))
+
+# -----------------------------
+# Join fishing points to closures
+# -----------------------------
+fishing_inside_closures <- st_join(
+  fishing_2019_sf,
+  closures_tbl %>% select(closure_area),
+  join = st_within,
+  left = FALSE
+)
+
+# -----------------------------
+# Clean gear labels
+# -----------------------------
+gear_labels <- function(x) {
+  case_when(
+    x == "dredge_fishing" ~ "Dredge Fishing",
+    x == "purse_seines" ~ "Purse Seines",
+    x == "pots_and_traps" ~ "Pots and Traps",
+    x == "other_fishing" ~ "Other Fishing",
+    x == "pole_and_line" ~ "Pole And Line",
+    x == "squid_jigger" ~ "Squid Jigger",
+    x == "trollers" ~ "Trollers",
+    x == "fixed_gear" ~ "Fixed Gear",
+    x == "other_seines" ~ "Other Seines",
+    x == "fishing" ~ "Unspecified Fishing",
+    x == "trawlers" ~ "Trawlers",
+    x == "set_gillnets" ~ "Set Gillnets",
+    x == "set_longlines" ~ "Set Longlines",
+    x == "tuna_purse_seines" ~ "Tuna Purse Seines",
+    x == "drifting_longlines" ~ "Drifting Longlines",
+    x == "other_purse_seines" ~ "Other Purse Seines",
+    TRUE ~ str_to_title(str_replace_all(x, "_", " "))
+  )
+}
+
+# -----------------------------
+# Summarise fishing hours inside closures
+# -----------------------------
+gear_by_closure <- fishing_inside_closures %>%
+  st_drop_geometry() %>%
+  group_by(fishing_class, closure_area) %>%
+  summarise(
+    fishing_hours = sum(fishing_hours, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -----------------------------
+# Build complete table with all gear types
+# -----------------------------
+gear_hours_tbl <- all_gears %>%
+  mutate(gear_type = gear_labels(fishing_class)) %>%
+  left_join(gear_by_closure, by = "fishing_class") %>%
+  select(gear_type, closure_area, fishing_hours) %>%
+  complete(
+    gear_type,
+    closure_area = c("GFCM Closure Area 1", "GFCM Closure Area 4"),
+    fill = list(fishing_hours = 0)
+  ) %>%
+  pivot_wider(
+    names_from = closure_area,
+    values_from = fishing_hours,
+    values_fill = 0
+  ) %>%
+  mutate(
+    Combined = `GFCM Closure Area 1` + `GFCM Closure Area 4`
+  ) %>%
+  mutate(
+    across(
+      c(`GFCM Closure Area 1`, `GFCM Closure Area 4`, Combined),
+      ~ round(.x, 1)
+    )
+  ) %>%
+  arrange(desc(Combined)) %>%
+  select(
+    gear_type,
+    `GFCM Closure Area 1`,
+    `GFCM Closure Area 4`,
+    Combined
+  )
+
+# optional check
+# names(gear_hours_tbl)
+# ncol(gear_hours_tbl)
+
+# -----------------------------
+# Render table
+# -----------------------------
+kbl(
+  gear_hours_tbl,
+  col.names = c(
+    "Gear type",
+    "GFCM Closure Area 1",
+    "GFCM Closure Area 4",
+    "Combined"
+  ),
+  align = c("l", "r", "r", "r"),
+  caption = "Total fishing hours by gear type inside GFCM closure areas in 2019"
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+Now lets export that table to a word document
+```{r}
+# Convert table to flextable
+ft <- flextable(gear_hours_tbl)
+
+# Format table
+ft <- ft |>
+  colformat_num(j = 2:4, digits = 1) |>
+  align(j = 2:4, align = "right", part = "all") |>
+  align(j = 1, align = "left", part = "all") |>
+  bold(part = "header") |>
+  autofit()
+
+# Create Word document
+doc <- read_docx() |>
+  body_add_par("Total fishing hours by gear type inside GFCM closure areas in 2019", style = "heading 2") |>
+  body_add_flextable(ft)
+
+# Save document
+print(doc, target = "closure_fishing_hours_2019.docx")
+```
+
+## Barplot
+```{r}
+# reshape and filter
+gear_hours_plot <- gear_hours_tbl %>%
+  pivot_longer(
+    cols = c(`GFCM Closure Area 1`, `GFCM Closure Area 4`),
+    names_to = "closure_area",
+    values_to = "fishing_hours"
+  ) %>%
+  filter(fishing_hours > 0)
+
+# bar chart
+p_bar <- ggplot(
+  gear_hours_plot,
+  aes(x = reorder(gear_type, fishing_hours),
+      y = fishing_hours,
+      fill = closure_area)
+) +
+  geom_col(
+    position = position_dodge(width = 0.7),
+    width = 0.65
+  ) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Fishing hours",
+    title = "Fishing effort inside GFCM closure areas in 2019"
+  ) +
+  scale_fill_manual(
+    name = "Fishing effort",
+    values = gfw_palette("chart")[c(1,5)]
+  ) +
+  theme_gfw() +
+  theme(
+    legend.position = "top",
+    axis.text = element_text(size = 9),
+    plot.title = element_text(size = 12)
+  )
+
+p_bar
+
+# ggsave(plot = last_plot(),
+#   filename = here::here ('figures','barplot.png'))
+```
+
+# Map
+Let's first make a general map that shows the two closure areas within the Mediterranean
+```{r, fig.width=10, fig.height=5}
+# === Add label field to each shapefile before combining ===
+gfcm1_lab <- gfcm1_sf %>%
+  mutate(area_name = "GFCM 1")
+
+gfcm4_lab <- gfcm4_sf %>%
+  mutate(area_name = "GFCM 4")
+
+# === Combine and project closure shapefiles ===
+closure_sf <- bind_rows(gfcm1_lab, gfcm4_lab) %>%
+  st_transform(best_proj)
+
+# === Create centroid label points ===
+closure_labels <- closure_sf %>%
+  st_centroid()
+
+# === Set bounding box for Mediterranean map ===
+bounding_med <- transform_box(
+  xlim = c(bbox[1, "x_min"], bbox[1, "x_max"]),
+  ylim = c(bbox[1, "y_min"], bbox[1, "y_max"]),
+  output_crs = best_proj
+)
+
+# === Generate locator map ===
+p_med_closures <- ggplot() +
+  geom_sf(
+    data = closure_sf,
+    fill = NA,
+    color = gfw_palette("orange")[1],
+    linewidth = 1
+  ) +
+  geom_gfw_land(center = best_center) +
+  geom_sf_text(
+    data = closure_labels %>% filter(area_name == "GFCM 1"),
+    aes(label = area_name),
+    nudge_x = 180000,
+    nudge_y = 80000,
+    size = 3.5,
+    fontface = "bold",
+    color = "white"
+  ) +
+  geom_sf_text(
+    data = closure_labels %>% filter(area_name == "GFCM 4"),
+    aes(label = area_name),
+    nudge_x = -180000,
+    nudge_y = 80000,
+    size = 3.5,
+    fontface = "bold",
+    color = "white"
+  ) +
+  labs(
+    title = "GFCM closure areas in the Mediterranean"
+  ) +
+  theme_gfw_map() +
+  theme(
+    plot.title = element_text(size = 12),
+    axis.title = element_blank(),
+    axis.text = element_text(size = 8)
+  ) +
+  coord_sf(
+    xlim = c(bounding_med$box_out[["xmin"]], bounding_med$box_out[["xmax"]]),
+    ylim = c(bounding_med$box_out[["ymin"]], bounding_med$box_out[["ymax"]]),
+    crs = bounding_med$out_crs
+  )
+
+# === Show map ===
+p_med_closures
+```
+
+Now lets generate zoomed-in maps of fishing effort around the two GFCM closure areas. 
+Fishing hours are aggregated by grid cell and mapped as a raster surface, with all layers 
+projected to a common coordinate reference system to ensure spatial alignment. 
+Closure boundaries are overlaid to show fishing activity occurring within and around each area.
+```{r, fig.width=11, fig.height=5}
+# -----------------------------
+# Settings
+# -----------------------------
+best_center <- 15
+best_proj <- str_c("+proj=eqearth +lon_0=", best_center, " +wktext", sep = "")
+
+# -----------------------------
+# Build fishing effort layer
+# -----------------------------
+f_hours_grid <- fishing_data %>%
+  dplyr::select(lon_bin, lat_bin, fishing_hours) %>%
+  filter(
+    !is.na(lon_bin),
+    !is.na(lat_bin),
+    !is.na(fishing_hours)
+  ) %>%
+  group_by(lon_bin, lat_bin) %>%
+  summarise(fishing_hours = sum(fishing_hours, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(fishing_hours), fishing_hours > 0) %>%
+  fishwatchr::recenter_raster(
+    x_lab = "lon_bin",
+    y_lab = "lat_bin",
+    fill_lab = "fishing_hours",
+    res = 0.05,
+    center = best_center
+  ) %>%
+  terra::rast(type = "xyz", crs = best_proj) %>%
+  terra::as.polygons(dissolve = FALSE) %>%
+  st_as_sf()
+
+names(f_hours_grid)[1] <- "fishing_hours"
+
+# -----------------------------
+# Make geometries valid and use same CRS
+# -----------------------------
+f_hours_map <- f_hours_grid %>%
+  st_make_valid() %>%
+  st_transform(best_proj)
+
+gfcm1_map <- gfcm1_sf %>%
+  st_make_valid() %>%
+  st_transform(best_proj)
+
+gfcm4_map <- gfcm4_sf %>%
+  st_make_valid() %>%
+  st_transform(best_proj)
+
+# Remove empty geometries if any
+f_hours_map <- f_hours_map[!st_is_empty(f_hours_map), ]
+gfcm1_map   <- gfcm1_map[!st_is_empty(gfcm1_map), ]
+gfcm4_map   <- gfcm4_map[!st_is_empty(gfcm4_map), ]
+
+# -----------------------------
+# Helper for tighter zoom bbox
+# -----------------------------
+get_bbox_limits <- function(sf_obj, pad_x = 120000, pad_y = 100000) {
+  bb <- st_bbox(sf_obj)
+  list(
+    xlim = c(as.numeric(bb["xmin"]) - pad_x, as.numeric(bb["xmax"]) + pad_x),
+    ylim = c(as.numeric(bb["ymin"]) - pad_y, as.numeric(bb["ymax"]) + pad_y)
+  )
+}
+
+lim_gfcm1 <- get_bbox_limits(gfcm1_map, pad_x = 120000, pad_y = 100000)
+lim_gfcm4 <- get_bbox_limits(gfcm4_map, pad_x = 120000, pad_y = 100000)
+
+# -----------------------------
+# Crop fishing effort around each closure
+# -----------------------------
+f_hours_1 <- suppressWarnings(
+  st_crop(
+    f_hours_map,
+    xmin = lim_gfcm1$xlim[1],
+    xmax = lim_gfcm1$xlim[2],
+    ymin = lim_gfcm1$ylim[1],
+    ymax = lim_gfcm1$ylim[2]
+  )
+)
+
+f_hours_4 <- suppressWarnings(
+  st_crop(
+    f_hours_map,
+    xmin = lim_gfcm4$xlim[1],
+    xmax = lim_gfcm4$xlim[2],
+    ymin = lim_gfcm4$ylim[1],
+    ymax = lim_gfcm4$ylim[2]
+  )
+)
+
+# -----------------------------
+# Safe helper for local scale max
+# -----------------------------
+safe_scale_max <- function(sf_obj, fallback = 1) {
+  if (nrow(sf_obj) == 0) return(fallback)
+  
+  vals <- sf_obj$fishing_hours
+  vals <- vals[is.finite(vals) & !is.na(vals)]
+  
+  if (length(vals) == 0) return(fallback)
+  if (length(vals) == 1) return(vals)
+  
+  out <- suppressWarnings(quantile(vals, 0.95, na.rm = TRUE, names = FALSE))
+  
+  if (!is.finite(out) || is.na(out) || out <= 0) {
+    out <- max(vals, na.rm = TRUE)
+  }
+  
+  if (!is.finite(out) || is.na(out) || out <= 0) out <- fallback
+  
+  out
+}
+
+zoom_max_1 <- safe_scale_max(f_hours_1, fallback = 1)
+zoom_max_4 <- safe_scale_max(f_hours_4, fallback = 1)
+
+# -----------------------------
+# Map 1
+# -----------------------------
+p_gfcm1 <- ggplot() +
+  geom_sf(
+    data = f_hours_1,
+    aes(fill = fishing_hours),
+    color = NA
+  ) +
+  geom_sf(
+    data = gfcm1_map,
+    fill = NA,
+    color = gfw_palette("orange")[1],
+    linewidth = 0.5
+  ) +
+  geom_gfw_land(center = best_center) +
+  labs(
+    title = "GFCM Closure Area 1",
+    fill = "Fishing hours"
+  ) +
+  scale_fill_gradientn(
+    colours = gfw_palette("map_effort_dark"),
+    limits = c(0, zoom_max_1),
+    oob = scales::squish,
+    trans = "sqrt",
+    na.value = NA
+  ) +
+  theme_gfw_map() +
+  theme(
+    plot.title = element_text(size = 11),
+    axis.title = element_blank(),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  ) +
+  coord_sf(
+    xlim = lim_gfcm1$xlim,
+    ylim = lim_gfcm1$ylim,
+    crs = st_crs(gfcm1_map)
+  )
+
+# -----------------------------
+# Map 2
+# -----------------------------
+p_gfcm4 <- ggplot() +
+  geom_sf(
+    data = f_hours_4,
+    aes(fill = fishing_hours),
+    color = NA
+  ) +
+  geom_sf(
+    data = gfcm4_map,
+    fill = NA,
+    color = gfw_palette("orange")[1],
+    linewidth = 0.5
+  ) +
+  geom_gfw_land(center = best_center) +
+  labs(
+    title = "GFCM Closure Area 4",
+    fill = "Fishing hours"
+  ) +
+  scale_fill_gradientn(
+    colours = gfw_palette("map_effort_dark"),
+    limits = c(0, zoom_max_4),
+    oob = scales::squish,
+    trans = "sqrt",
+    na.value = NA
+  ) +
+  theme_gfw_map() +
+  theme(
+    plot.title = element_text(size = 11),
+    axis.title = element_blank(),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  ) +
+  coord_sf(
+    xlim = lim_gfcm4$xlim,
+    ylim = lim_gfcm4$ylim,
+    crs = st_crs(gfcm4_map)
+  )
+
+# -----------------------------
+# Combine into one figure
+# -----------------------------
+p_gfcm1 + p_gfcm4
+```
+
+Now lets combine those figures into one final figure
+```{r, fig.width=12, fig.height=10}
+p_med_closures <- p_med_closures +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+final_map <- p_med_closures /
+             (p_gfcm1 | p_gfcm4) +
+             plot_layout(heights = c(1.25, 1))
+
+final_map
+
+# ggsave(plot = last_plot(),
+#   filename = here::here ('figures','overall_map.png'))
+```
+
+Now lets create a figure showing the closure areas overlaid with fishing effort for trawlers and longliners.
+We have two types of longliners so we combine "drifting_longlines" and "set_longlines"
+```{r, fig.width=11, fig.height=10}
+# -----------------------------
+# Settings
+# -----------------------------
+best_center <- 15
+best_proj <- str_c("+proj=eqearth +lon_0=", best_center, " +wktext", sep = "")
+
+# -----------------------------
+# Recode fishing classes into two gear groups
+# -----------------------------
+fishing_gear <- fishing_data %>%
+  mutate(
+    gear_group = case_when(
+      fishing_class == "trawlers" ~ "Trawlers",
+      fishing_class %in% c("set_longlines", "drifting_longlines") ~ "Longliners",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(gear_group),
+    !is.na(lon_bin),
+    !is.na(lat_bin),
+    !is.na(fishing_hours)
+  ) %>%
+  group_by(gear_group, lon_bin, lat_bin) %>%
+  summarise(fishing_hours = sum(fishing_hours, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(fishing_hours), fishing_hours > 0)
+
+# -----------------------------
+# Convert gridded effort to sf polygons by gear group
+# -----------------------------
+build_effort_sf <- function(df) {
+  out <- df %>%
+    fishwatchr::recenter_raster(
+      x_lab = "lon_bin",
+      y_lab = "lat_bin",
+      fill_lab = "fishing_hours",
+      res = 0.05,
+      center = best_center
+    ) %>%
+    terra::rast(type = "xyz", crs = best_proj) %>%
+    terra::as.polygons(dissolve = FALSE) %>%
+    st_as_sf() %>%
+    st_make_valid() %>%
+    st_transform(best_proj)
+  
+  names(out)[1] <- "fishing_hours"
+  out <- out[!st_is_empty(out), ]
+  out
+}
+
+f_trawlers_map <- fishing_gear %>%
+  filter(gear_group == "Trawlers") %>%
+  build_effort_sf()
+
+f_longliners_map <- fishing_gear %>%
+  filter(gear_group == "Longliners") %>%
+  build_effort_sf()
+
+# -----------------------------
+# Prepare closure layers
+# -----------------------------
+gfcm1_map <- gfcm1_sf %>%
+  st_make_valid() %>%
+  st_transform(best_proj)
+
+gfcm4_map <- gfcm4_sf %>%
+  st_make_valid() %>%
+  st_transform(best_proj)
+
+gfcm1_map <- gfcm1_map[!st_is_empty(gfcm1_map), ]
+gfcm4_map <- gfcm4_map[!st_is_empty(gfcm4_map), ]
+
+# -----------------------------
+# Helper for tight zoom around each closure
+# -----------------------------
+get_bbox_limits <- function(sf_obj, pad_x = 120000, pad_y = 100000) {
+  bb <- st_bbox(sf_obj)
+  list(
+    xlim = c(as.numeric(bb["xmin"]) - pad_x, as.numeric(bb["xmax"]) + pad_x),
+    ylim = c(as.numeric(bb["ymin"]) - pad_y, as.numeric(bb["ymax"]) + pad_y)
+  )
+}
+
+lim_gfcm1 <- get_bbox_limits(gfcm1_map, pad_x = 120000, pad_y = 100000)
+lim_gfcm4 <- get_bbox_limits(gfcm4_map, pad_x = 120000, pad_y = 100000)
+
+# -----------------------------
+# Crop effort around each closure
+# -----------------------------
+crop_effort <- function(sf_obj, limits) {
+  suppressWarnings(
+    st_crop(
+      sf_obj,
+      xmin = limits$xlim[1],
+      xmax = limits$xlim[2],
+      ymin = limits$ylim[1],
+      ymax = limits$ylim[2]
+    )
+  )
+}
+
+f_trawlers_1   <- crop_effort(f_trawlers_map, lim_gfcm1)
+f_trawlers_4   <- crop_effort(f_trawlers_map, lim_gfcm4)
+f_longliners_1 <- crop_effort(f_longliners_map, lim_gfcm1)
+f_longliners_4 <- crop_effort(f_longliners_map, lim_gfcm4)
+
+# -----------------------------
+# Helper for local scale max
+# -----------------------------
+safe_scale_max <- function(sf_obj, fallback = 1) {
+  if (nrow(sf_obj) == 0) return(fallback)
+  
+  vals <- sf_obj$fishing_hours
+  vals <- vals[is.finite(vals) & !is.na(vals)]
+  
+  if (length(vals) == 0) return(fallback)
+  if (length(vals) == 1) return(vals)
+  
+  out <- suppressWarnings(quantile(vals, 0.95, na.rm = TRUE, names = FALSE))
+  
+  if (!is.finite(out) || is.na(out) || out <= 0) {
+    out <- max(vals, na.rm = TRUE)
+  }
+  
+  if (!is.finite(out) || is.na(out) || out <= 0) out <- fallback
+  out
+}
+
+zoom_max_trawlers_1   <- safe_scale_max(f_trawlers_1)
+zoom_max_trawlers_4   <- safe_scale_max(f_trawlers_4)
+zoom_max_longliners_1 <- safe_scale_max(f_longliners_1)
+zoom_max_longliners_4 <- safe_scale_max(f_longliners_4)
+
+# -----------------------------
+# Helper to build panel maps
+# -----------------------------
+make_panel_map <- function(effort_sf, closure_sf, limits, panel_title, scale_max) {
+  ggplot() +
+    geom_sf(
+      data = effort_sf,
+      aes(fill = fishing_hours),
+      color = NA
+    ) +
+    geom_sf(
+      data = closure_sf,
+      fill = NA,
+      color = gfw_palette("orange")[1],
+      linewidth = 0.5
+    ) +
+    geom_gfw_land(center = best_center) +
+    labs(
+      title = panel_title,
+      fill = "Fishing hours"
+    ) +
+    scale_fill_gradientn(
+      colours = gfw_palette("map_effort_dark"),
+      limits = c(0, scale_max),
+      oob = scales::squish,
+      trans = "sqrt",
+      na.value = NA
+    ) +
+    theme_gfw_map() +
+    theme(
+      plot.title = element_text(size = 11),
+      axis.title = element_blank(),
+      axis.text = element_text(size = 8),
+      legend.position = "bottom",
+      legend.title = element_text(size = 9),
+      legend.text = element_text(size = 8)
+    ) +
+    coord_sf(
+      xlim = limits$xlim,
+      ylim = limits$ylim,
+      crs = st_crs(closure_sf)
+    )
+}
+
+# -----------------------------
+# Build four panels
+# -----------------------------
+p_trawlers_1 <- make_panel_map(
+  effort_sf   = f_trawlers_1,
+  closure_sf  = gfcm1_map,
+  limits      = lim_gfcm1,
+  panel_title = "Trawlers — GFCM Closure Area 1",
+  scale_max   = zoom_max_trawlers_1
+)
+
+p_trawlers_4 <- make_panel_map(
+  effort_sf   = f_trawlers_4,
+  closure_sf  = gfcm4_map,
+  limits      = lim_gfcm4,
+  panel_title = "Trawlers — GFCM Closure Area 4",
+  scale_max   = zoom_max_trawlers_4
+)
+
+p_longliners_1 <- make_panel_map(
+  effort_sf   = f_longliners_1,
+  closure_sf  = gfcm1_map,
+  limits      = lim_gfcm1,
+  panel_title = "Longliners — GFCM Closure Area 1",
+  scale_max   = zoom_max_longliners_1
+)
+
+p_longliners_4 <- make_panel_map(
+  effort_sf   = f_longliners_4,
+  closure_sf  = gfcm4_map,
+  limits      = lim_gfcm4,
+  panel_title = "Longliners — GFCM Closure Area 4",
+  scale_max   = zoom_max_longliners_4
+)
+
+# -----------------------------
+# Combine into four-panel figure
+# -----------------------------
+library(patchwork)
+
+four_panel_map <-
+  (p_trawlers_1 | p_trawlers_4) /
+  (p_longliners_1 | p_longliners_4)
+
+four_panel_map
+
+# ggsave(plot = last_plot(),
+#   filename = here::here ('figures','map_effort_by_gear.png'))
+```
